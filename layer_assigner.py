@@ -676,7 +676,7 @@ class App(tk.Tk):
 
         self.filepath = tk.StringVar()
         self.analysis_method = tk.StringVar(value="1")
-        self.precision = tk.StringVar(value="2")
+        self.precision = tk.StringVar(value="0")
         self.queue = queue.Queue()
 
         self.create_widgets()
