@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Script para automação de tarefas em desenhos DXF. Executa quatro funções principais:
-1. Reorganiza entidades de layers específicos para uma nova estrutura de layers padronizada.
-2. Subclassifica entidades do layer '0' (TEXT, HATCH) para novos layers específicos.
-3. Move as entidades restantes no layer '0' para um novo layer 'Linhas de chamadas'.
-4. Analisa e agrupa entidades fechadas idênticas em novos layers de 'peças equivalentes'.
+Script para automação de tarefas em desenhos DXF. Oferece dois modos de operação:
+1. Análise por Área: Agrupa peças com geometria idêntica (área e perímetro).
+2. Análise por Texto: Identifica peças com base em textos próximos (ex: "CHAPA XXX") e as agrupa.
+
+Ambos os modos também executam tarefas de organização de layers padrão.
 
 Persona: Desenvolvedor Python Sênior
 Projeto: Ferramenta de automação para desenhos de estruturas metálicas.
-Revisão: 19.0 - 2025-10-06 (Adicionada função para mover entidades restantes do layer '0')
+Revisão: 20.0 - 2025-10-07 (Implementado método alternativo de análise por texto)
 """
 
 import ezdxf
 import os
 import math
+import re
+import unicodedata
 from collections import defaultdict
 from ezdxf.path import make_path
-from ezdxf.math import area as path_area, Vec3
+from ezdxf.math import area as path_area, Vec3, BoundingBox
 from ezdxf import DXFValueError
 
 # --- CONFIGURAÇÕES ---
@@ -25,6 +27,31 @@ from ezdxf import DXFValueError
 COLOR_RED = 1
 COLOR_YELLOW = 2
 COLOR_GREEN = 3
+
+# --- CONFIGURAÇÕES PARA ANÁLISE POR TEXTO (MÉTODO 2) ---
+RAIO_DE_BUSCA = 800.0  # Ajuste conforme a escala desenho.
+ARROW_MAX_SIZE = 4.0   # Tamanho máximo (unidades do desenho) para reconhecer uma entidade pequena como seta
+ARROW_MAX_SIZE_ALT = 12.0  # Segundo limite maior usado com heurística de proporção
+ARROW_ASPECT_RATIO = 4.0   # Proporção (maior/menor) mínima para considerar entidade longa e fina (seta)
+ARROW_PROXIMITY = 20.0    # Distância máxima para considerar uma entidade próxima a uma dimensão (unidades do desenho)
+
+# --- PALETA DE CORES E CAMADAS PADRÃO (MÉTODO 2) ---
+CHAPA_COLORS = [6, 4, 3, 5, 230, 150] # Magenta, Ciano, Verde, Azul, Laranja, Roxo...
+
+SEMANTIC_LAYERS = {
+    "chumbador": ("CHUMBADORES", 1), # Vermelho
+    "perfil":    ("PERFIS", 1),      # Vermelho
+    "eixo":      ("EIXOS", 2),        # Amarelo
+}
+
+COLOR_FURO = 1       # Vermelho
+COLOR_LAYER_0 = 2    # Amarelo
+COLOR_TEXTO_ALVO = 3 # Verde
+
+PADROES_ALVO = [
+    re.compile(r'CHAPA\s+"?([A-Z0-9]+)"?', re.IGNORECASE),
+    re.compile(r'CH-([A-Z0-9]+)', re.IGNORECASE)
+]
 
 # Mapa para organizar layers existentes em NOVOS layers
 LAYER_ORGANIZATION_MAP = {
@@ -42,10 +69,15 @@ LAYER_ZERO_SUBCLASSIFICATION = {
     ('HATCH',): ('LAYER0_HACHURAS', COLOR_RED),
 }
 
-# Configurações para a análise de peças equivalentes
-PECA_EQ_LAYER_COLORS = [1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15]
+# --- CONFIGURAÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ---
+PECA_EQ_LAYER_COLORS = [1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15] # Amarelo (2) removido
 PECA_EQ_LAYER_PREFIX = "PECA_EQ"
 
+# --- FUNÇÕES AUXILIARES GERAIS ---
+
+def get_aci_color_name(aci_index):
+    color_map = {1: "Vermelho", 2: "Amarelo", 3: "Verde", 4: "Ciano", 5: "Azul", 6: "Magenta"}
+    return color_map.get(aci_index, f"ACI {aci_index}")
 
 def organize_existing_layers(doc, msp):
     """
@@ -131,6 +163,19 @@ def organize_remaining_layer_zero_entities(doc, msp):
     else:
         print("Nenhuma entidade restou no layer '0' para ser organizada.")
 
+# --- FUNÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ---
+
+def process_drawing_by_area(filepath: str, precision: int):
+    """
+    Executa as rotinas de otimização no desenho: reorganiza, subclassifica e agrupa peças por área/perímetro.
+    """
+    doc, msp = _load_drawing(filepath)
+    if not doc:
+        return
+
+    _run_common_organization_tasks(doc, msp)
+
+    _analyze_and_group_by_area(doc, msp, precision, filepath)
 
 def get_closed_entity_properties(entity) -> tuple[str, float, float] | None:
     """
@@ -163,28 +208,13 @@ def get_closed_entity_properties(entity) -> tuple[str, float, float] | None:
         return None
     return None
 
-def process_drawing(filepath: str, precision: int):
-    """
-    Executa as rotinas de otimização no desenho: reorganiza, subclassifica e agrupa peças.
-    """
-    try:
-        print(f"Carregando o desenho: {os.path.basename(filepath)}...")
-        doc = ezdxf.readfile(filepath)
-        msp = doc.modelspace()
-    except Exception as e:
-        print(f"Erro ao carregar o arquivo DXF: {e}")
-        return
-
-    # Tarefa 1: Reorganizar layers existentes para uma nova estrutura
+def _run_common_organization_tasks(doc, msp):
     organize_existing_layers(doc, msp)
-    
-    # Tarefa 2: Subclassificar entidades do layer '0'
     subclassify_layer_zero(doc, msp)
-
-    # Tarefa 3: Organizar o que sobrou no layer '0'
     organize_remaining_layer_zero_entities(doc, msp)
 
-    # Tarefa 4: Encontrar e agrupar peças equivalentes
+def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
+    """Agrupa peças equivalentes com base na área e perímetro."""
     print("\n--- Analisando geometrias para encontrar peças equivalentes ---")
     entities_by_properties = defaultdict(list)
     print(f"Analisando todas as {len(msp)} entidades do desenho com precisão de {precision} casas decimais...")
@@ -228,7 +258,352 @@ def process_drawing(filepath: str, precision: int):
             for entity in entities:
                 entity.dxf.layer = new_layer_name
 
-    base, ext = os.path.splitext(filepath)
+    _save_drawing(doc, filepath)
+
+# --- FUNÇÕES PARA ANÁLISE POR TEXTO (MÉTODO 2) ---
+
+def obter_centro_geometrico(entity):
+    try:
+        bbox = BoundingBox(entity.vertices_in_wcs())
+        return bbox.center.xy
+    except (AttributeError, TypeError, ValueError):
+        try:
+            if entity.dxftype() in ['CIRCLE', 'ARC']:
+                return entity.dxf.center.xy
+            if entity.dxftype() in ['TEXT', 'MTEXT', 'INSERT', 'ATTRIB']:
+                return entity.dxf.insert.xy
+        except AttributeError:
+            return None
+    return None
+
+def get_entity_bbox_size(entity):
+    """Retorna (width, height) do bounding box da entidade em WCS, ou (None, None) se inválido."""
+    dx = None
+    try:
+        dx = entity.dxftype()
+    except Exception:
+        dx = None
+
+    # LINE: usar start/end se disponível
+    if dx == 'LINE':
+        try:
+            s = entity.dxf.start
+            e = entity.dxf.end
+            xs = [s[0], e[0]]
+            ys = [s[1], e[1]]
+            width = max(xs) - min(xs)
+            height = max(ys) - min(ys)
+            return (abs(width), abs(height))
+        except Exception:
+            pass
+
+    # TRACE: tenta obter pontos através de vários métodos
+    if dx == 'TRACE' or dx == 'POLYLINE' or dx == 'LWPOLYLINE':
+        # 1) vertices_in_wcs
+        try:
+            verts = entity.vertices_in_wcs()
+            xs = [v[0] for v in verts]
+            ys = [v[1] for v in verts]
+            if xs and ys:
+                width = max(xs) - min(xs)
+                height = max(ys) - min(ys)
+                return (abs(width), abs(height))
+        except Exception:
+            pass
+        # 2) points() method
+        try:
+            pts = list(entity.points())
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            if xs and ys:
+                width = max(xs) - min(xs)
+                height = max(ys) - min(ys)
+                return (abs(width), abs(height))
+        except Exception:
+            pass
+
+    # Fallback geral: vertices_in_wcs for other entity types
+    try:
+        verts = entity.vertices_in_wcs()
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        if not xs or not ys:
+            return (None, None)
+        width = max(xs) - min(xs)
+        height = max(ys) - min(ys)
+        return (abs(width), abs(height))
+    except Exception:
+        pass
+
+    # CIRCLE/ARC fallback
+    try:
+        if dx in ['CIRCLE', 'ARC']:
+            r = float(entity.dxf.radius)
+            return (2*r, 2*r)
+    except Exception:
+        pass
+
+    return (None, None)
+
+def is_arrow(entity):
+    """Heurística simples para detectar setas/arrowheads: geometria curta/pequena."""
+    try:
+        dx = entity.dxftype()
+    except Exception:
+        return False
+    if dx not in ('LINE', 'TRACE', 'LWPOLYLINE', 'POLYLINE'):
+        return False
+    w, h = get_entity_bbox_size(entity)
+    if w is None or h is None:
+        return False
+    maxdim = max(w, h)
+    mindim = min(w, h) if min(w, h) > 0 else 0.0
+    if maxdim <= ARROW_MAX_SIZE:
+        return True
+    if maxdim <= ARROW_MAX_SIZE_ALT and mindim > 0:
+        aspect = maxdim / mindim
+        if aspect >= ARROW_ASPECT_RATIO:
+            return True
+    return False
+
+def ensure_layer(doc, layer_name, color):
+    if layer_name not in doc.layers:
+        print(f"  + Criando camada '{layer_name}' com a cor {get_aci_color_name(color)}.")
+        doc.layers.new(name=layer_name, dxfattribs={'color': color})
+    else:
+        doc.layers.get(layer_name).dxf.color = color
+
+def set_layer0_to_yellow(doc):
+    """Define a cor da camada '0' para amarelo."""
+    layer_name = '0'
+    try:
+        if layer_name not in doc.layers:
+            print(f"  + Criando camada '{layer_name}' com a cor {get_aci_color_name(COLOR_LAYER_0)}.")
+            doc.layers.new(name=layer_name, dxfattribs={'color': COLOR_LAYER_0})
+        else:
+            doc.layers.get(layer_name).dxf.color = COLOR_LAYER_0
+            print(f"  * Camada '{layer_name}' atualizada para cor {get_aci_color_name(COLOR_LAYER_0)}.")
+    except Exception as e:
+        print(f"Aviso: não foi possível ajustar a cor da camada '0': {e}")
+
+def _normalize_layer_name(name: str) -> str:
+    """Normaliza o nome de uma camada para correspondência."""
+    if not name:
+        return ''
+    nfkd = unicodedata.normalize('NFKD', name)
+    only_ascii = ''.join([c for c in nfkd if not unicodedata.combining(c)])
+    cleaned = only_ascii.replace(' ', '').replace('-', '').replace('_', '').lower()
+    return cleaned
+
+def set_g_symbol_to_yellow(doc):
+    """Garante que qualquer camada tipo G-SYMBOL seja definida como amarela."""
+    candidates = ['G-SYMBOL', 'G SIMBOLO', 'G_SIMBOLO', 'GSYMBOL']
+    normalized_candidates = {_normalize_layer_name(c): c for c in candidates}
+    found = False
+    try:
+        for layer in doc.layers:
+            nl = _normalize_layer_name(layer.dxf.name)
+            if nl in normalized_candidates:
+                layer.dxf.color = COLOR_LAYER_0
+                print(f"  * Camada existente '{layer.dxf.name}' atualizada para cor {get_aci_color_name(COLOR_LAYER_0)}.")
+                found = True
+        if not found:
+            default_name = 'G SIMBOLO'
+            ensure_layer(doc, default_name, COLOR_LAYER_0)
+    except Exception as e:
+        print(f"Aviso: erro ao procurar camadas G-SYMBOL: {e}")
+
+def process_cotas_and_texts(doc, msp, processed_handles):
+    """Move DIMENSION para 'COTAS' e MTEXT para 'TEXTO'."""
+    cotas_layer = 'COTAS'
+    texto_layer = 'TEXTO'
+    ensure_layer(doc, cotas_layer, COLOR_LAYER_0)
+    ensure_layer(doc, texto_layer, COLOR_TEXTO_ALVO)
+
+    for ent in msp:
+        if ent.dxf.handle in processed_handles:
+            continue
+        dxftype = ent.dxftype()
+        if dxftype == 'DIMENSION':
+            ent.dxf.layer = cotas_layer
+            ent.dxf.color = COLOR_LAYER_0
+            processed_handles.add(ent.dxf.handle)
+        elif dxftype == 'MTEXT':
+            ent.dxf.layer = texto_layer
+            ent.dxf.color = COLOR_TEXTO_ALVO
+            processed_handles.add(ent.dxf.handle)
+
+def collect_dimension_centers(msp):
+    """Escaneia o modelspace em busca de entidades DIMENSION e retorna seus centros."""
+    centers = []
+    for ent in msp.query('DIMENSION'):
+        c = obter_centro_geometrico(ent)
+        if c:
+            centers.append(c)
+    return centers
+
+def move_nearby_unclosed_lines_to_setas(doc, msp, alvos_chapa, processed_handles, arrow_proximity, raio_de_busca):
+    """Move linhas/traces não fechadas próximas às CHAPAs para a camada 'SETAS'."""
+    setas_layer = 'SETAS'
+    ensure_layer(doc, setas_layer, COLOR_LAYER_0)
+    
+    chapa_centers = [loc for locs in alvos_chapa.values() for loc in locs if loc]
+
+    for entity in msp:
+        if entity.dxf.handle in processed_handles:
+            continue
+        
+        dxftype = entity.dxftype()
+        if dxftype not in ('LINE', 'TRACE', 'LWPOLYLINE', 'POLYLINE'):
+            continue
+        
+        if getattr(entity, 'is_closed', False):
+            continue
+
+        centro = obter_centro_geometrico(entity)
+        if not centro:
+            continue
+
+        for chapa_loc in chapa_centers:
+            if math.dist(centro, chapa_loc) <= raio_de_busca:
+                entity.dxf.layer = setas_layer
+                entity.dxf.color = COLOR_LAYER_0
+                processed_handles.add(entity.dxf.handle)
+                break
+
+def process_drawing_by_text(filepath: str, **kwargs):
+    """
+    Executa a reestruturação do desenho com base na identificação de textos.
+    """
+    doc, msp = _load_drawing(filepath)
+    if not doc:
+        return
+
+    print("Iniciando reestruturação com base em texto (Método 2).")
+    set_layer0_to_yellow(doc)
+    set_g_symbol_to_yellow(doc)
+    
+    processed_handles = set()
+    
+    # --- FASE 1: SEMÂNTICA ---
+    print("\n--- Fase 1: Identificando sistemas (Perfis, Chumbadores, Eixos) ---")
+    for keyword, (layer_name, color) in SEMANTIC_LAYERS.items():
+        ensure_layer(doc, layer_name, color)
+
+    for entity in msp:
+        original_layer = entity.dxf.layer.lower()
+        eh_tracejado = hasattr(entity.dxf, 'linetype') and entity.dxf.linetype.lower() not in ['continuous', 'byblock', 'bylayer']
+
+        for keyword, (target_layer, _) in SEMANTIC_LAYERS.items():
+            if (keyword == 'eixo' and eh_tracejado) or keyword in original_layer:
+                entity.dxf.layer = target_layer
+                entity.dxf.color = 256 # BYLAYER
+                processed_handles.add(entity.dxf.handle)
+                break
+
+    dimension_centers = collect_dimension_centers(msp)
+
+    # --- FASE 2: AGRUPAMENTO DAS CHAPAS ---
+    print("\n--- Fase 2: Mapeando e agrupando Chapas por texto ---")
+    alvos_chapa = defaultdict(list)
+    for entity in msp.query('TEXT MTEXT ATTRIB'):
+        text_content = ""
+        if entity.dxftype() in ('TEXT', 'ATTRIB'):
+            text_content = entity.dxf.text
+        elif entity.dxftype() == 'MTEXT':
+            text_content = entity.plain_text()
+        
+        for padrao in PADROES_ALVO:
+            match = padrao.search(text_content)
+            if match:
+                nome_peca = match.group(1).upper()
+                alvos_chapa[nome_peca].append(obter_centro_geometrico(entity))
+                entity.dxf.color = COLOR_TEXTO_ALVO
+                processed_handles.add(entity.dxf.handle)
+                break
+
+    color_index = 0
+    for nome_peca, localizacoes in alvos_chapa.items():
+        novo_layer_name = f"CHAPA {nome_peca}"
+        cor_da_chapa = CHAPA_COLORS[color_index % len(CHAPA_COLORS)]
+        ensure_layer(doc, novo_layer_name, cor_da_chapa)
+        color_index += 1
+
+        for entity in msp:
+            if entity.dxf.handle in processed_handles:
+                continue
+            
+            loc_entidade = obter_centro_geometrico(entity)
+            if not loc_entidade:
+                continue
+
+            is_closed = getattr(entity, 'is_closed', False)
+            original_layer = entity.dxf.layer.lower()
+
+            if not is_closed and original_layer == '0':
+                entity.dxf.color = COLOR_LAYER_0
+                continue
+
+            for loc_alvo in localizacoes:
+                if loc_alvo and math.dist(loc_entidade, loc_alvo) <= RAIO_DE_BUSCA:
+                    if is_arrow(entity):
+                        entity.dxf.color = COLOR_LAYER_0
+                        break
+
+                    entity.dxf.layer = novo_layer_name
+                    entity.dxf.color = 256 # BYLAYER
+                    processed_handles.add(entity.dxf.handle)
+                    break
+
+    move_nearby_unclosed_lines_to_setas(doc, msp, alvos_chapa, processed_handles, ARROW_PROXIMITY, RAIO_DE_BUSCA)
+
+    # --- FASE 3: COTAS, TEXTOS E LIMPEZA ---
+    print("\n--- Fase 3: Processando Cotas, Textos, Furos e Limpeza ---")
+    process_cotas_and_texts(doc, msp, processed_handles)
+
+    for entity in msp:
+        if entity.dxf.handle in processed_handles:
+            continue
+
+        dxftype = entity.dxftype()
+        if dxftype == 'HATCH':
+            ensure_layer(doc, 'HATCHES', COLOR_FURO)
+            entity.dxf.layer = 'HATCHES'
+            entity.dxf.color = COLOR_FURO
+            processed_handles.add(entity.dxf.handle)
+            continue
+
+        is_hole_candidate = (
+            dxftype == 'CIRCLE' or 
+            dxftype == 'TRACE' or
+            (dxftype in ['LWPOLYLINE', 'POLYLINE'] and getattr(entity, 'is_closed', False))
+        )
+        if is_hole_candidate:
+            entity.dxf.color = COLOR_FURO
+        elif entity.dxf.layer.lower() == '0':
+            entity.dxf.color = COLOR_LAYER_0
+
+    print("\n" + "="*50)
+    print("Reestruturação por texto concluída!")
+    _save_drawing_with_report(doc, msp, filepath, processed_handles)
+
+
+# --- FUNÇÕES DE GERENCIAMENTO (CARREGAR/SALVAR/MENU) ---
+
+def _load_drawing(filepath: str):
+    """Carrega um arquivo DXF e retorna o documento e o modelspace."""
+    try:
+        print(f"Carregando o desenho: {os.path.basename(filepath)}...")
+        doc = ezdxf.readfile(filepath)
+        msp = doc.modelspace()
+        return doc, msp
+    except Exception as e:
+        print(f"Erro ao carregar o arquivo DXF: {e}")
+        return None, None
+
+def _save_drawing(doc, original_filepath: str):
+    """Salva o documento modificado com um novo nome."""
+    base, ext = os.path.splitext(original_filepath)
     output_path = f"{base}_processado{ext}"
 
     try:
@@ -242,12 +617,51 @@ def process_drawing(filepath: str, precision: int):
         else:
             print(f"Erro fatal ao tentar salvar o arquivo: {e}")
 
+def _save_drawing_with_report(doc, msp, original_filepath: str, processed_handles: set):
+    """Salva o desenho e gera relatórios de contagem e handles."""
+    base, ext = os.path.splitext(original_filepath)
+    output_path = f"{base}_processado_texto{ext}"
+
+    try:
+        print(f"\nSalvando o desenho modificado em: {output_path}")
+        doc.saveas(output_path)
+        print("\nProcesso concluído com sucesso!")
+    except IOError as e:
+        if isinstance(e, PermissionError) or (hasattr(e, 'errno') and e.errno == 13):
+            print(f"\nERRO DE PERMISSÃO AO SALVAR O ARQUIVO: {output_path}")
+            print("Por favor, feche o arquivo no seu software CAD e tente executar o script novamente.")
+        else:
+            print(f"Erro fatal ao tentar salvar o arquivo: {e}")
+        return
+
+    # --- RELATÓRIO: contagens por camada ---
+    layer_counts = defaultdict(int)
+    for ent in msp:
+        layer_counts[ent.dxf.layer] += 1
+
+    report_path = os.path.splitext(output_path)[0] + '_report.txt'
+    try:
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write('Relatório de contagens por camada\n')
+            f.write(f'Arquivo processado: {os.path.basename(output_path)}\n')
+            f.write('---\n')
+            total = 0
+            for layer_name, count in sorted(layer_counts.items()):
+                f.write(f"{layer_name}: {count}\n")
+                total += count
+            f.write('---\n')
+            f.write(f'Total de entidades: {total}\n')
+            f.write(f'Entidades processadas (handles): {len(processed_handles)}\n')
+        print(f"Relatório de contagem por camada salvo em: '{os.path.abspath(report_path)}'")
+    except Exception as e:
+        print(f"Erro ao gravar relatório: {e}")
+
 def main():
     """
     Função principal que gerencia a interface com o usuário no console.
     """
     print("---------------------------------------------------------------------")
-    print("---      Ferramenta de Otimização de Layers para DXF              ---")
+    print("---      Ferramenta de Otimização e Análise de Layers para DXF   ---")
     print("---------------------------------------------------------------------")
     
     filepath = ""
@@ -259,21 +673,34 @@ def main():
         else:
             print("Arquivo não encontrado. Por favor, forneça um caminho válido.")
 
-    precision = 2
     while True:
-        try:
-            precision_input = input(f"Digite a precisão para análise de peças (casas decimais, padrão é {precision}, pressione Enter para usar):\n> ").strip()
-            if not precision_input:
-                break 
-            precision = int(precision_input)
-            if precision >= 0:
-                break
-            else:
-                print("Por favor, digite um número positivo.")
-        except ValueError:
-            print("Entrada inválida. Por favor, digite um número inteiro.")
+        print("\nEscolha o método de análise:")
+        print("1. Análise por Área (agrupa peças com geometria idêntica)")
+        print("2. Análise por Texto (agrupa peças com base em textos 'CHAPA XXX')")
+        choice = input("Digite 1 ou 2: ").strip()
 
-    process_drawing(filepath, precision)
+        if choice == '1':
+            precision = 2
+            while True:
+                try:
+                    precision_input = input(f"\nDigite a precisão para análise de área (casas decimais, padrão é {precision}, pressione Enter para usar):\n> ").strip()
+                    if not precision_input:
+                        break 
+                    precision = int(precision_input)
+                    if precision >= 0:
+                        break
+                    else:
+                        print("Por favor, digite um número positivo.")
+                except ValueError:
+                    print("Entrada inválida. Por favor, digite um número inteiro.")
+            process_drawing_by_area(filepath, precision)
+            break
+        elif choice == '2':
+            process_drawing_by_text(filepath)
+            break
+        else:
+            print("Opção inválida. Por favor, escolha 1 ou 2.")
+
     input("\nPressione Enter para sair.")
 
 if __name__ == "__main__":
