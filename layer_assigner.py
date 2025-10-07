@@ -18,6 +18,11 @@ import math
 import re
 import unicodedata
 from collections import defaultdict
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext
+import sys
+import threading
+import queue
 from ezdxf.path import make_path
 from ezdxf.math import area as path_area, Vec3, BoundingBox
 from ezdxf import DXFValueError
@@ -663,45 +668,132 @@ def main():
     print("---------------------------------------------------------------------")
     print("---      Ferramenta de Otimização e Análise de Layers para DXF   ---")
     print("---------------------------------------------------------------------")
-    
-    filepath = ""
-    while True:
-        filepath_input = input("Por favor, arraste o arquivo DXF para cá ou cole o caminho e pressione Enter:\n> ").strip()
-        filepath = filepath_input.strip('"\'')
-        if filepath and os.path.exists(filepath):
-            break
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Otimizador de Layers DXF")
+        self.geometry("700x600")
+
+        self.filepath = tk.StringVar()
+        self.analysis_method = tk.StringVar(value="1")
+        self.precision = tk.StringVar(value="2")
+        self.queue = queue.Queue()
+
+        self.create_widgets()
+        self.redirect_stdout()
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- File Selection ---
+        file_frame = ttk.LabelFrame(main_frame, text="Arquivo DXF", padding="10")
+        file_frame.pack(fill=tk.X, pady=5)
+        file_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(file_frame, text="Caminho:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(file_frame, textvariable=self.filepath).grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+        ttk.Button(file_frame, text="Procurar...", command=self.browse_file).grid(row=0, column=2, padx=5, pady=5)
+
+        # --- Analysis Method ---
+        method_frame = ttk.LabelFrame(main_frame, text="Método de Análise", padding="10")
+        method_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Radiobutton(method_frame, text="Análise por Área (peças com geometria idêntica)", variable=self.analysis_method, value="1", command=self.toggle_precision).pack(anchor=tk.W)
+        self.precision_frame = ttk.Frame(method_frame, padding="0 0 0 20")
+        self.precision_frame.pack(fill=tk.X)
+        ttk.Label(self.precision_frame, text="Precisão (casas decimais):").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(self.precision_frame, textvariable=self.precision, width=5).pack(side=tk.LEFT)
+
+        ttk.Radiobutton(method_frame, text="Análise por Texto (identifica 'CHAPA XXX')", variable=self.analysis_method, value="2", command=self.toggle_precision).pack(anchor=tk.W)
+
+        # --- Process Button ---
+        self.process_button = ttk.Button(main_frame, text="Processar Desenho", command=self.start_processing)
+        self.process_button.pack(pady=10, fill=tk.X)
+
+        # --- Output Console ---
+        console_frame = ttk.LabelFrame(main_frame, text="Console de Saída", padding="10")
+        console_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.console = scrolledtext.ScrolledText(console_frame, wrap=tk.WORD, height=15)
+        self.console.pack(fill=tk.BOTH, expand=True)
+
+    def toggle_precision(self):
+        if self.analysis_method.get() == "1":
+            self.precision_frame.pack(fill=tk.X)
         else:
-            print("Arquivo não encontrado. Por favor, forneça um caminho válido.")
+            self.precision_frame.pack_forget()
 
-    while True:
-        print("\nEscolha o método de análise:")
-        print("1. Análise por Área (agrupa peças com geometria idêntica)")
-        print("2. Análise por Texto (agrupa peças com base em textos 'CHAPA XXX')")
-        choice = input("Digite 1 ou 2: ").strip()
+    def browse_file(self):
+        filename = filedialog.askopenfilename(
+            title="Selecione o arquivo DXF",
+            filetypes=(("Arquivos DXF", "*.dxf"), ("Todos os arquivos", "*.*"))
+        )
+        if filename:
+            self.filepath.set(filename)
 
-        if choice == '1':
-            precision = 2
-            while True:
-                try:
-                    precision_input = input(f"\nDigite a precisão para análise de área (casas decimais, padrão é {precision}, pressione Enter para usar):\n> ").strip()
-                    if not precision_input:
-                        break 
-                    precision = int(precision_input)
-                    if precision >= 0:
-                        break
-                    else:
-                        print("Por favor, digite um número positivo.")
-                except ValueError:
-                    print("Entrada inválida. Por favor, digite um número inteiro.")
-            process_drawing_by_area(filepath, precision)
-            break
-        elif choice == '2':
-            process_drawing_by_text(filepath)
-            break
+    def start_processing(self):
+        filepath = self.filepath.get()
+        if not filepath or not os.path.exists(filepath):
+            self.console.insert(tk.END, "ERRO: Por favor, selecione um arquivo DXF válido.\n")
+            return
+
+        self.console.delete('1.0', tk.END)
+        self.process_button.config(state=tk.DISABLED, text="Processando...")
+
+        method = self.analysis_method.get()
+        if method == "1":
+            try:
+                precision = int(self.precision.get())
+                if precision < 0: raise ValueError
+                target = lambda: process_drawing_by_area(filepath, precision)
+            except ValueError:
+                self.console.insert(tk.END, "ERRO: A precisão deve ser um número inteiro positivo.\n")
+                self.processing_finished()
+                return
+        else: # method == "2"
+            target = lambda: process_drawing_by_text(filepath)
+
+        self.thread = threading.Thread(target=target)
+        self.thread.daemon = True
+        self.thread.start()
+        self.after(100, self.check_queue)
+
+    def check_queue(self):
+        try:
+            while True: # Loop to empty the queue
+                line = self.queue.get_nowait()
+                self.console.insert(tk.END, line)
+                self.console.see(tk.END)
+        except queue.Empty:
+            pass
+
+        if self.thread.is_alive():
+            self.after(100, self.check_queue)
         else:
-            print("Opção inválida. Por favor, escolha 1 ou 2.")
+            self.processing_finished()
 
-    input("\nPressione Enter para sair.")
+    def processing_finished(self):
+        self.process_button.config(state=tk.NORMAL, text="Processar Desenho")
+        self.console.insert(tk.END, "\n--- FIM DO PROCESSO ---\n")
+        self.console.see(tk.END)
+
+    def redirect_stdout(self):
+        class QueueIO:
+            def __init__(self, q):
+                self.queue = q
+
+            def write(self, text):
+                self.queue.put(text)
+
+            def flush(self):
+                sys.__stdout__.flush()
+
+        sys.stdout = QueueIO(self.queue)
+        sys.stderr = QueueIO(self.queue)
+
+def main():
+    app = App()
+    app.mainloop()
 
 if __name__ == "__main__":
     main()
