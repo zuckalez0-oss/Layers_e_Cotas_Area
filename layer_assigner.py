@@ -238,7 +238,15 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
     else:
         print(f"\nForam encontrados {len(entities_by_properties)} grupos distintos de peças com geometrias equivalentes.")
         layer_counter = 0
-        for prop_key, entities in sorted(entities_by_properties.items()):
+        non_circle_counter = 0
+        # Ordena os grupos pela área e depois pelo perímetro, ambos em ordem decrescente.
+        sorted_groups = sorted(
+            entities_by_properties.items(),
+            # Ordena pela área total do grupo (área da peça * quantidade) e depois pelo perímetro.
+            key=lambda item: (item[0][1] * len(item[1]), item[0][2]),
+            reverse=True
+        )
+        for prop_key, entities in sorted_groups:
             layer_counter += 1
             new_layer_name = f"{PECA_EQ_LAYER_PREFIX}_{layer_counter}"
             
@@ -255,8 +263,9 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
             if is_like_a_circle:
                 color_index = COLOR_RED
             else:
-                color_index = PECA_EQ_LAYER_COLORS[(layer_counter - 1) % len(PECA_EQ_LAYER_COLORS)]
-            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor: {'Vermelho' if is_like_a_circle else 'Padrão'}")
+                color_index = PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]
+                non_circle_counter += 1
+            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor ACI: {color_index}")
 
             if new_layer_name not in doc.layers:
                 doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
@@ -712,7 +721,7 @@ class App(tk.Tk):
         self.process_button.pack(pady=10, fill=tk.X)
 
         # --- Output Console ---
-        console_frame = ttk.LabelFrame(main_frame, text="Console de Saída", padding="10")
+        console_frame = ttk.LabelFrame(main_frame, text="Console de Saída", padding="10") 
         console_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         self.console = scrolledtext.ScrolledText(console_frame, wrap=tk.WORD, height=15)
         self.console.pack(fill=tk.BOTH, expand=True)
