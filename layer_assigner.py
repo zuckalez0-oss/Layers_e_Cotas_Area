@@ -43,7 +43,7 @@ LAYER_ZERO_SUBCLASSIFICATION = {
 }
 
 # Configurações para a análise de peças equivalentes
-PECA_EQ_LAYER_COLORS = [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15]
+PECA_EQ_LAYER_COLORS = [1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15]
 PECA_EQ_LAYER_PREFIX = "PECA_EQ"
 
 
@@ -206,9 +206,22 @@ def process_drawing(filepath: str, precision: int):
         for prop_key, entities in sorted(entities_by_properties.items()):
             layer_counter += 1
             new_layer_name = f"{PECA_EQ_LAYER_PREFIX}_{layer_counter}"
-            color_index = PECA_EQ_LAYER_COLORS[(layer_counter - 1) % len(PECA_EQ_LAYER_COLORS)]
+            
             entity_type, area_key, perimeter_key = prop_key
-            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}")
+            is_like_a_circle = False
+            # Verifica se a forma é um círculo ou se aproxima de um
+            if entity_type == 'CIRCLE':
+                is_like_a_circle = True
+            elif perimeter_key > 1e-6: # Evita divisão por zero
+                isoperimetric_ratio = (4 * math.pi * area_key) / (perimeter_key**2)
+                if isoperimetric_ratio > 0.98: # Se a forma for muito próxima de um círculo
+                    is_like_a_circle = True
+
+            if is_like_a_circle:
+                color_index = COLOR_RED
+            else:
+                color_index = PECA_EQ_LAYER_COLORS[(layer_counter - 1) % len(PECA_EQ_LAYER_COLORS)]
+            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor: {'Vermelho' if is_like_a_circle else 'Padrão'}")
 
             if new_layer_name not in doc.layers:
                 doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
@@ -265,4 +278,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
