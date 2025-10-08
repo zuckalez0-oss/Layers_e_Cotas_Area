@@ -9,7 +9,7 @@ Ambos os modos também executam tarefas de organização de layers padrão.
 
 Persona: Desenvolvedor Python Sênior
 Projeto: Ferramenta de automação para desenhos de estruturas metálicas.
-Revisão: 20.0 - 2025-10-07 (Implementado método alternativo de análise por texto)
+Revisão: 21.0 - 2025-10-08 (Implementado pré-processamento para furos e vistas laterais)
 """
 
 import ezdxf
@@ -38,7 +38,7 @@ RAIO_DE_BUSCA = 800.0  # Ajuste conforme a escala desenho.
 ARROW_MAX_SIZE = 4.0   # Tamanho máximo (unidades do desenho) para reconhecer uma entidade pequena como seta
 ARROW_MAX_SIZE_ALT = 12.0  # Segundo limite maior usado com heurística de proporção
 ARROW_ASPECT_RATIO = 4.0   # Proporção (maior/menor) mínima para considerar entidade longa e fina (seta)
-ARROW_PROXIMITY = 20.0    # Distância máxima para considerar uma entidade próxima a uma dimensão (unidades do desenho)
+ARROW_PROXIMITY = 20.0     # Distância máxima para considerar uma entidade próxima a uma dimensão (unidades do desenho)
 
 # --- PALETA DE CORES E CAMADAS PADRÃO (MÉTODO 2) ---
 CHAPA_COLORS = [6, 4, 3, 5, 230, 150] # Magenta, Ciano, Verde, Azul, Laranja, Roxo...
@@ -46,7 +46,7 @@ CHAPA_COLORS = [6, 4, 3, 5, 230, 150] # Magenta, Ciano, Verde, Azul, Laranja, Ro
 SEMANTIC_LAYERS = {
     "chumbador": ("CHUMBADORES", 1), # Vermelho
     "perfil":    ("PERFIS", 1),      # Vermelho
-    "eixo":      ("EIXOS", 2),        # Amarelo
+    "eixo":      ("EIXOS", 2),       # Amarelo
 }
 
 COLOR_FURO = 1       # Vermelho
@@ -83,6 +83,100 @@ PECA_EQ_LAYER_PREFIX = "PECA_EQ"
 def get_aci_color_name(aci_index):
     color_map = {1: "Vermelho", 2: "Amarelo", 3: "Verde", 4: "Ciano", 5: "Azul", 6: "Magenta"}
     return color_map.get(aci_index, f"ACI {aci_index}")
+
+# --- NOVO ---
+def is_hole_side_view(entity, tolerance=0.1) -> tuple[bool, float]:
+    """
+    Verifica se uma entidade (LWPOLYLINE/POLYLINE) é uma vista lateral de um furo (pequeno e quadrado).
+    Retorna uma tupla: (True/False, dimensão_se_verdadeiro).
+    """
+    if entity.dxftype() not in ('LWPOLYLINE', 'POLYLINE', 'TRACE'):
+        return False, 0.0
+
+    try:
+        # Para polilinhas, a BoundingBox é a forma mais confiável de obter as dimensões
+        bbox = BoundingBox(entity.vertices_in_wcs())
+        if not bbox.has_data:
+            return False, 0.0
+        
+        width = bbox.size.x
+        height = bbox.size.y
+        
+        # Verifica se é aproximadamente um quadrado
+        if math.isclose(width, height, rel_tol=tolerance):
+            # Retorna True e a dimensão (que será comparada com o diâmetro)
+            return True, width 
+    except (AttributeError, IndexError, DXFValueError):
+        return False, 0.0
+    return False, 0.0
+
+# --- NOVO ---
+def pre_process_holes_and_side_views(doc, msp) -> set:
+    """
+    Identifica furos (círculos) e suas vistas laterais (quadrados) e os move para uma camada dedicada.
+    Esta função deve ser executada antes de qualquer outra lógica de agrupamento.
+    Retorna um conjunto de handles das entidades processadas.
+    """
+    print("\n--- Pré-processamento: Identificando furos e vistas laterais ---")
+    
+    HOLE_LAYER_NAME = "FUROS_E_VISTAS"
+    HOLE_LAYER_COLOR = COLOR_RED
+    
+    # Garante que a camada exista
+    if HOLE_LAYER_NAME not in doc.layers:
+        doc.layers.new(name=HOLE_LAYER_NAME, dxfattribs={'color': HOLE_LAYER_COLOR})
+
+    processed_handles = set()
+    circles_by_diameter = defaultdict(list)
+    side_view_candidates = []
+
+    # 1. Encontra todos os círculos e candidatos a vista lateral
+    for entity in msp:
+        if entity.dxftype() == 'CIRCLE':
+            diameter = round(entity.dxf.radius * 2)
+            circles_by_diameter[diameter].append(entity)
+        elif entity.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'TRACE'):
+            side_view_candidates.append(entity)
+            
+    if not circles_by_diameter:
+        print(" - Nenhum furo (círculo) encontrado. Pulando esta etapa.")
+        return processed_handles
+
+    print(f" - Encontrados {sum(len(v) for v in circles_by_diameter.values())} furos, agrupados em {len(circles_by_diameter)} diâmetros distintos.")
+
+    # 2. Associa as vistas laterais aos furos
+    matched_side_views = defaultdict(list)
+    for entity in side_view_candidates:
+        is_side_view, dimension = is_hole_side_view(entity)
+        if is_side_view:
+            rounded_dim = round(dimension)
+            # Verifica se existe um grupo de furos com diâmetro correspondente
+            if rounded_dim in circles_by_diameter:
+                matched_side_views[rounded_dim].append(entity)
+
+    # 3. Move todas as entidades correspondentes (furos e vistas) para a nova camada
+    moved_count = 0
+    for diameter, circle_list in circles_by_diameter.items():
+        # Move os círculos
+        for circle in circle_list:
+            circle.dxf.layer = HOLE_LAYER_NAME
+            processed_handles.add(circle.dxf.handle)
+            moved_count += 1
+        
+        # Move as vistas laterais correspondentes
+        if diameter in matched_side_views:
+            side_views = matched_side_views[diameter]
+            print(f"   - Associando {len(side_views)} vistas laterais ao diâmetro {diameter}.")
+            for sv_entity in side_views:
+                sv_entity.dxf.layer = HOLE_LAYER_NAME
+                processed_handles.add(sv_entity.dxf.handle)
+                moved_count += 1
+    
+    if moved_count > 0:
+        print(f" - Total de {moved_count} entidades (furos e vistas) movidas para a camada '{HOLE_LAYER_NAME}'.")
+        
+    return processed_handles
+
 
 def organize_existing_layers(doc, msp):
     """
@@ -192,16 +286,45 @@ def is_rectangular(entity, tolerance=0.01) -> bool:
         return False
     return False
 
+def is_long_and_thin(entity, aspect_ratio_threshold=4.0) -> tuple[bool, float]:
+    """
+    Verifica se uma entidade (LWPOLYLINE/POLYLINE) é longa e fina.
+    Retorna uma tupla: (True/False, comprimento_se_verdadeiro).
+    """
+    if entity.dxftype() not in ('LWPOLYLINE', 'POLYLINE'):
+        return False, 0.0
+
+    try:
+        bbox = BoundingBox(entity.vertices_in_wcs())
+        if not bbox.has_data:
+            return False, 0.0
+        
+        width = bbox.size.x
+        height = bbox.size.y
+        
+        if min(width, height) > 0:
+            aspect_ratio = max(width, height) / min(width, height)
+            if aspect_ratio >= aspect_ratio_threshold:
+                return True, max(width, height) # É longo e fino, retorna o comprimento
+    except (AttributeError, IndexError, ZeroDivisionError):
+        return False, 0.0
+    return False, 0.0
+
+# --- MODIFICADO ---
 def process_drawing_by_area(filepath: str, precision: int):
     """
-    Executa as rotinas de otimização no desenho: reorganiza, subclassifica e agrupa peças por área/perímetro.
+    Executa as rotinas de otimização no desenho: pré-processa furos, reorganiza, subclassifica e agrupa peças por área/perímetro.
     """
     doc, msp = _load_drawing(filepath)
     if not doc:
         return
 
+    # --- ETAPA CONSTANTE: Executa o pré-processamento de furos PRIMEIRO ---
+    processed_handles = pre_process_holes_and_side_views(doc, msp)
+    
     _run_common_organization_tasks(doc, msp)    
-    _analyze_and_group_by_area(doc, msp, precision, filepath)
+    _analyze_and_group_by_area(doc, msp, precision, filepath, processed_handles)
+
 
 def get_closed_entity_properties(entity) -> tuple[str, float, float] | None:
     """
@@ -269,7 +392,8 @@ def get_open_entity_length(entity, precision: int) -> float | None:
     except (AttributeError, IndexError):
         return None
 
-def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
+# --- MODIFICADO ---
+def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_handles: set):
     """Agrupa peças equivalentes com base na área e perímetro."""
     print("\n--- Analisando geometrias para encontrar peças equivalentes ---")
     entities_by_properties = defaultdict(list)
@@ -279,6 +403,10 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
     # 1. Agrupar todas as formas fechadas por suas propriedades (área, perímetro)
     #    e coletar as entidades não fechadas para análise posterior.
     for entity in msp:
+        # --- MODIFICADO ---: Pula entidades já processadas na etapa de furos
+        if entity.dxf.handle in processed_handles:
+            continue
+            
         if not hasattr(entity, 'dxftype'): # Ignora entidades sem tipo
             continue
         properties = get_closed_entity_properties(entity)
@@ -295,22 +423,39 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
         else:
             unclosed_entities.append(entity)
 
-    # 2. Lógica para associar enrijecedores a furos por diâmetro
-    print("\n--- Associando enrijecedores a furos por diâmetro ---")
-    # Itera sobre as entidades não fechadas (linhas/enrijecedores)
-    for entity in unclosed_entities:
-        raw_length = get_open_entity_length(entity, precision)
-        if raw_length is None:
+    # 2. Lógica para associar enrijecedores (polígonos finos) a furos por diâmetro
+    print("\n--- Associando enrijecedores (linhas) a furos (círculos) por diâmetro ---")
+    # Cria um mapa de diâmetros para os grupos de círculos
+    circle_diameter_map = {
+        prop_key[1]: entities
+        for prop_key, entities in entities_by_properties.items()
+        if prop_key[0] == 'CIRCLE'
+    }
+
+    # Lista de grupos de enrijecedores a serem removidos após a mesclagem
+    stiffener_groups_to_remove = []
+
+    # Itera sobre uma cópia dos grupos para poder modificar o dicionário original
+    for prop_key, entities in list(entities_by_properties.items()):
+        # Verifica apenas grupos de polilinhas
+        if prop_key[0] not in ('LWPOLYLINE', 'POLYLINE'):
             continue
-        
-        length = round(raw_length)
-        # Cria a chave de busca correspondente ao grupo de círculos
-        circle_group_key = ('CIRCLE', length)
-        
-        # Se um grupo de círculos com esse diâmetro existe, associa a linha
-        if circle_group_key in entities_by_properties:
-            print(f"  - Encontrado enrijecedor (comprimento: {length}) correspondente a um furo. Associando...")
-            entities_by_properties[circle_group_key].append(entity)
+
+        # Pega a primeira entidade do grupo para verificar sua forma
+        is_stiffener, length = is_long_and_thin(entities[0])
+        if is_stiffener:
+            rounded_length = round(length)
+            # Verifica se existe um grupo de furos com diâmetro correspondente
+            if rounded_length in circle_diameter_map:
+                print(f"   - Encontrado grupo de enrijecedores (comprimento: {rounded_length}). Associando ao grupo de furos correspondente...")
+                # Adiciona as entidades do grupo de enrijecedores ao grupo de furos
+                circle_diameter_map[rounded_length].extend(entities)
+                # Marca o grupo de enrijecedores para remoção
+                stiffener_groups_to_remove.append(prop_key)
+
+    # Remove os grupos de enrijecedores que foram mesclados
+    for key in stiffener_groups_to_remove:
+        del entities_by_properties[key]
 
     if not entities_by_properties:
         print("Nenhuma forma fechada válida foi encontrada para agrupar.")
@@ -489,7 +634,7 @@ def is_arrow(entity):
 
 def ensure_layer(doc, layer_name, color):
     if layer_name not in doc.layers:
-        print(f"  + Criando camada '{layer_name}' com a cor {get_aci_color_name(color)}.")
+        print(f"   + Criando camada '{layer_name}' com a cor {get_aci_color_name(color)}.")
         doc.layers.new(name=layer_name, dxfattribs={'color': color})
     else:
         doc.layers.get(layer_name).dxf.color = color
@@ -499,11 +644,11 @@ def set_layer0_to_yellow(doc):
     layer_name = '0'
     try:
         if layer_name not in doc.layers:
-            print(f"  + Criando camada '{layer_name}' com a cor {get_aci_color_name(COLOR_LAYER_0)}.")
+            print(f"   + Criando camada '{layer_name}' com a cor {get_aci_color_name(COLOR_LAYER_0)}.")
             doc.layers.new(name=layer_name, dxfattribs={'color': COLOR_LAYER_0})
         else:
             doc.layers.get(layer_name).dxf.color = COLOR_LAYER_0
-            print(f"  * Camada '{layer_name}' atualizada para cor {get_aci_color_name(COLOR_LAYER_0)}.")
+            print(f"   * Camada '{layer_name}' atualizada para cor {get_aci_color_name(COLOR_LAYER_0)}.")
     except Exception as e:
         print(f"Aviso: não foi possível ajustar a cor da camada '0': {e}")
 
@@ -526,7 +671,7 @@ def set_g_symbol_to_yellow(doc):
             nl = _normalize_layer_name(layer.dxf.name)
             if nl in normalized_candidates:
                 layer.dxf.color = COLOR_LAYER_0
-                print(f"  * Camada existente '{layer.dxf.name}' atualizada para cor {get_aci_color_name(COLOR_LAYER_0)}.")
+                print(f"   * Camada existente '{layer.dxf.name}' atualizada para cor {get_aci_color_name(COLOR_LAYER_0)}.")
                 found = True
         if not found:
             default_name = 'G SIMBOLO'
@@ -592,6 +737,7 @@ def move_nearby_unclosed_lines_to_setas(doc, msp, alvos_chapa, processed_handles
                 processed_handles.add(entity.dxf.handle)
                 break
 
+# --- MODIFICADO ---
 def process_drawing_by_text(filepath: str, **kwargs):
     """
     Executa a reestruturação do desenho com base na identificação de textos.
@@ -600,11 +746,12 @@ def process_drawing_by_text(filepath: str, **kwargs):
     if not doc:
         return
 
-    print("Iniciando reestruturação com base em texto (Método 2).")
+    # --- ETAPA CONSTANTE: Executa o pré-processamento de furos PRIMEIRO ---
+    processed_handles = pre_process_holes_and_side_views(doc, msp)
+
+    print("\nIniciando reestruturação com base em texto (Método 2).")
     set_layer0_to_yellow(doc)
     set_g_symbol_to_yellow(doc)
-    
-    processed_handles = set()
     
     # --- FASE 1: SEMÂNTICA ---
     print("\n--- Fase 1: Identificando sistemas (Perfis, Chumbadores, Eixos) ---")
@@ -612,6 +759,10 @@ def process_drawing_by_text(filepath: str, **kwargs):
         ensure_layer(doc, layer_name, color)
 
     for entity in msp:
+        # Pula entidades já processadas
+        if entity.dxf.handle in processed_handles:
+            continue
+            
         original_layer = entity.dxf.layer.lower()
         eh_tracejado = hasattr(entity.dxf, 'linetype') and entity.dxf.linetype.lower() not in ['continuous', 'byblock', 'bylayer']
 
@@ -628,6 +779,10 @@ def process_drawing_by_text(filepath: str, **kwargs):
     print("\n--- Fase 2: Mapeando e agrupando Chapas por texto ---")
     alvos_chapa = defaultdict(list)
     for entity in msp.query('TEXT MTEXT ATTRIB'):
+        # Pula entidades já processadas
+        if entity.dxf.handle in processed_handles:
+            continue
+
         text_content = ""
         if entity.dxftype() in ('TEXT', 'ATTRIB'):
             text_content = entity.dxf.text
