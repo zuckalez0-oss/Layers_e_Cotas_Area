@@ -75,7 +75,14 @@ LAYER_ZERO_SUBCLASSIFICATION = {
 }
 
 # --- CONFIGURAÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ---
-PECA_EQ_LAYER_COLORS = [1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15] # Amarelo (2) removido
+# Cores ACI: 1=Vermelho, 3=Verde, 4=Ciano, 5=Azul, 6=Magenta, 8,9,10...
+
+# --- Paleta de cores para as camadas PECA_EQ ---
+# Modifique estas constantes para alterar as cores das camadas geradas.
+COR_CHAPA_BASE = 5  # Azul (para a maior peça, PECA_EQ_1)
+CORES_SECUNDARIAS = [3, 1, 3, 8, 9, 10, 11, 12, 13, 14, 15] # Magenta, Ciano, Verde, etc.
+
+PECA_EQ_LAYER_COLORS = [COR_CHAPA_BASE] + CORES_SECUNDARIAS
 PECA_EQ_LAYER_PREFIX = "PECA_EQ"
 
 # --- FUNÇÕES AUXILIARES GERAIS ---
@@ -492,6 +499,43 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
                 doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
             for entity in entities:
                 entity.dxf.layer = new_layer_name
+
+    # --- LÓGICA DE REDIRECIONAMENTO DE LAYER (PÓS-PROCESSAMENTO) ---
+    print("\n--- Redirecionando layers de vistas diferentes ---")
+    source_layer_name = f"{PECA_EQ_LAYER_PREFIX}_5"
+    target_layer_name = f"{PECA_EQ_LAYER_PREFIX}_1"
+
+    if source_layer_name in doc.layers and target_layer_name in doc.layers:
+        entities_to_move = msp.query(f'*[layer=="{source_layer_name}"]')
+        count = len(entities_to_move)
+        if count > 0:
+            print(f" - Movendo {count} peças do layer '{source_layer_name}' para o layer '{target_layer_name}'.")
+            for entity in entities_to_move:
+                entity.dxf.layer = target_layer_name
+            
+            # Remove a camada de origem que agora está vazia
+            try:
+                doc.layers.remove(source_layer_name)
+                print(f" - Layer '{source_layer_name}' removido.")
+            except DXFValueError: # Pode acontecer se a camada não puder ser removida
+                print(f" - Aviso: Não foi possível remover o layer '{source_layer_name}'.")
+
+    # Redireciona a camada de furos e vistas para a PECA_EQ_1
+    source_layer_furos = "FUROS_E_VISTAS"
+    if source_layer_furos in doc.layers and target_layer_name in doc.layers:
+        entities_to_move = msp.query(f'*[layer=="{source_layer_furos}"]')
+        count = len(entities_to_move)
+        if count > 0:
+            print(f" - Movendo {count} peças do layer '{source_layer_furos}' para o layer '{target_layer_name}'.")
+            for entity in entities_to_move:
+                entity.dxf.layer = target_layer_name
+            
+            # Remove a camada de origem que agora está vazia
+            try:
+                doc.layers.remove(source_layer_furos)
+                print(f" - Layer '{source_layer_furos}' removido.")
+            except DXFValueError:
+                print(f" - Aviso: Não foi possível remover o layer '{source_layer_furos}'.")
 
     _save_drawing(doc, filepath)
 
