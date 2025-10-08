@@ -74,9 +74,8 @@ LAYER_ZERO_SUBCLASSIFICATION = {
     ('HATCH',): ('LAYER0_HACHURAS', COLOR_RED),
 }
 
-# --- CONFIGURAÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ---
+# ●▽●▽●▽●▽●▽●▽●▽● CONFIGURAÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ●▽●▽●▽●▽●▽●▽●▽●
 # Cores ACI: 1=Vermelho, 3=Verde, 4=Ciano, 5=Azul, 6=Magenta, 8,9,10...
-
 # --- Paleta de cores para as camadas PECA_EQ ---
 # Modifique estas constantes para alterar as cores das camadas geradas.
 COR_CHAPA_BASE = 5  # Azul (para a maior peça, PECA_EQ_1)
@@ -84,7 +83,7 @@ CORES_SECUNDARIAS = [3, 1, 3, 8, 9, 10, 11, 12, 13, 14, 15] # Magenta, Ciano, Ve
 
 PECA_EQ_LAYER_COLORS = [COR_CHAPA_BASE] + CORES_SECUNDARIAS
 PECA_EQ_LAYER_PREFIX = "PECA_EQ"
-
+# ●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽▽ 
 # --- FUNÇÕES AUXILIARES GERAIS ---
 
 def get_aci_color_name(aci_index):
