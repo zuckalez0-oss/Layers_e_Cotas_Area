@@ -169,6 +169,28 @@ def organize_remaining_layer_zero_entities(doc, msp):
         print("Nenhuma entidade restou no layer '0' para ser organizada.")
 
 # --- FUNÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ---
+def is_rectangular(entity, tolerance=0.01) -> bool:
+    """
+    Verifica se uma entidade (LWPOLYLINE/POLYLINE) é um retângulo.
+    Retorna True se for retangular e não quadrado, False caso contrário.
+    """
+    if entity.dxftype() not in ('LWPOLYLINE', 'POLYLINE'):
+        return False
+
+    try:
+        bbox = BoundingBox(entity.vertices_in_wcs())
+        if not bbox.has_data:
+            return False
+        
+        width = bbox.size.x
+        height = bbox.size.y
+        
+        # Verifica se não é quadrado (com uma tolerância)
+        if not math.isclose(width, height, rel_tol=tolerance):
+            return True # É retangular
+    except (AttributeError, IndexError):
+        return False
+    return False
 
 def process_drawing_by_area(filepath: str, precision: int):
     """
@@ -178,8 +200,7 @@ def process_drawing_by_area(filepath: str, precision: int):
     if not doc:
         return
 
-    _run_common_organization_tasks(doc, msp)
-
+    _run_common_organization_tasks(doc, msp)    
     _analyze_and_group_by_area(doc, msp, precision, filepath)
 
 def get_closed_entity_properties(entity) -> tuple[str, float, float] | None:
@@ -218,44 +239,131 @@ def _run_common_organization_tasks(doc, msp):
     subclassify_layer_zero(doc, msp)
     organize_remaining_layer_zero_entities(doc, msp)
 
+def get_open_entity_length(entity, precision: int) -> float | None:
+    """Calcula o comprimento de uma entidade aberta como LINE ou LWPOLYLINE."""
+    dxftype = entity.dxftype()
+    length = 0.0
+    try:
+        if dxftype == 'LINE':
+            length = entity.dxf.start.distance(entity.dxf.end)
+        elif dxftype in ('LWPOLYLINE', 'POLYLINE') and not entity.is_closed:
+            # O TypeError: '_GeneratorContextManager' object is not iterable
+            # sugere que entity.points() está retornando um gerenciador de contexto
+            # em vez de um iterador direto em alguns casos.
+            # Esta lógica tenta lidar com ambas as possibilidades de forma defensiva.
+            try:
+                # Tenta usar como um gerenciador de contexto primeiro
+                with entity.points() as points_iterable:
+                    points = list(points_iterable)
+            except AttributeError:
+                # Se não for um gerenciador de contexto (ex: falta __enter__/__exit__),
+                # então deve ser um iterador direto.
+                points = list(entity.points())
+            
+            for i in range(len(points) - 1):
+                # Usar apenas os componentes x, y para criar o Vec3
+                length += Vec3(points[i][:2]).distance(Vec3(points[i+1][:2]))
+        else:
+            return None
+        return round(length, precision)
+    except (AttributeError, IndexError):
+        return None
+
 def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
     """Agrupa peças equivalentes com base na área e perímetro."""
     print("\n--- Analisando geometrias para encontrar peças equivalentes ---")
     entities_by_properties = defaultdict(list)
+    unclosed_entities = []
     print(f"Analisando todas as {len(msp)} entidades do desenho com precisão de {precision} casas decimais...")
 
+    # 1. Agrupar todas as formas fechadas por suas propriedades (área, perímetro)
+    #    e coletar as entidades não fechadas para análise posterior.
     for entity in msp:
-        if not hasattr(entity, 'dxftype'):
+        if not hasattr(entity, 'dxftype'): # Ignora entidades sem tipo
             continue
         properties = get_closed_entity_properties(entity)
         if properties:
             dxftype, area, perimeter = properties
-            prop_key = (dxftype, round(area, precision), round(perimeter, precision))
+            # Para círculos, a chave de agrupamento será o diâmetro arredondado.
+            # Para outras formas, mantém a lógica de área/perímetro.
+            if dxftype == 'CIRCLE':
+                diameter = round(2 * math.sqrt(area / math.pi))
+                prop_key = (dxftype, diameter)
+            else:
+                prop_key = (dxftype, round(area, precision), round(perimeter, precision))
             entities_by_properties[prop_key].append(entity)
+        else:
+            unclosed_entities.append(entity)
+
+    # 2. Lógica para associar enrijecedores a furos por diâmetro
+    print("\n--- Associando enrijecedores a furos por diâmetro ---")
+    # Itera sobre as entidades não fechadas (linhas/enrijecedores)
+    for entity in unclosed_entities:
+        raw_length = get_open_entity_length(entity, precision)
+        if raw_length is None:
+            continue
+        
+        length = round(raw_length)
+        # Cria a chave de busca correspondente ao grupo de círculos
+        circle_group_key = ('CIRCLE', length)
+        
+        # Se um grupo de círculos com esse diâmetro existe, associa a linha
+        if circle_group_key in entities_by_properties:
+            print(f"  - Encontrado enrijecedor (comprimento: {length}) correspondente a um furo. Associando...")
+            entities_by_properties[circle_group_key].append(entity)
 
     if not entities_by_properties:
         print("Nenhuma forma fechada válida foi encontrada para agrupar.")
     else:
         print(f"\nForam encontrados {len(entities_by_properties)} grupos distintos de peças com geometrias equivalentes.")
         layer_counter = 0
-        non_circle_counter = 0
+        non_circle_counter = 0        
+        # 3. Ordena os grupos (agora com enrijecedores já incluídos nos grupos de furos)
         # Ordena os grupos pela área e depois pelo perímetro, ambos em ordem decrescente.
         sorted_groups = sorted(
             entities_by_properties.items(),
-            # Ordena pela área total do grupo (área da peça * quantidade) e depois pelo perímetro.
-            key=lambda item: (item[0][1] * len(item[1]), item[0][2]),
+            # A chave de ordenação agora precisa lidar com os dois formatos de prop_key
+            key=lambda item: (
+                (item[0][1] if item[0][0] == 'CIRCLE' else item[0][1] * len(item[1])),
+                (0 if item[0][0] == 'CIRCLE' else item[0][2])
+            ),
             reverse=True
         )
+
+        # 4. Lógica para mesclar PECA_EQ_5 e PECA_EQ_6 se PECA_EQ_5 for retangular
+        if len(sorted_groups) >= 6:
+            group_5_key, group_5_entities = sorted_groups[4]
+            first_entity_of_group_5 = group_5_entities[0]
+
+            if is_rectangular(first_entity_of_group_5):
+                print("\n--- Lógica Especial: PECA_EQ_5 é retangular. Mesclando com PECA_EQ_6. ---")
+                
+                # Pega as entidades do grupo 6
+                group_6_key, group_6_entities = sorted_groups[5]
+                
+                # Adiciona as entidades do grupo 6 ao grupo 5
+                group_5_entities.extend(group_6_entities)
+                print(f" - {len(group_6_entities)} peças do grupo 6 (área ~{group_6_key[1]}) foram movidas para o grupo 5.")
+                # Remove o grupo 6 da lista
+                del sorted_groups[5]
+
+        # 5. Cria os layers e atribui as entidades
         for prop_key, entities in sorted_groups:
             layer_counter += 1
             new_layer_name = f"{PECA_EQ_LAYER_PREFIX}_{layer_counter}"
             
-            entity_type, area_key, perimeter_key = prop_key
+            entity_type = prop_key[0]
             is_like_a_circle = False
             # Verifica se a forma é um círculo ou se aproxima de um
             if entity_type == 'CIRCLE':
                 is_like_a_circle = True
-            elif perimeter_key > 1e-6: # Evita divisão por zero
+                area_key = round(math.pi * (prop_key[1]/2)**2)
+                perimeter_key = round(math.pi * prop_key[1])
+                print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo 'CIRCLE' com diâmetro ~{prop_key[1]}. Cor ACI: {COLOR_RED}")
+            else:
+                area_key = prop_key[1]
+                perimeter_key = prop_key[2]
+                print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor ACI: {PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]}")
                 isoperimetric_ratio = (4 * math.pi * area_key) / (perimeter_key**2)
                 if isoperimetric_ratio > 0.98: # Se a forma for muito próxima de um círculo
                     is_like_a_circle = True
@@ -265,7 +373,6 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str):
             else:
                 color_index = PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]
                 non_circle_counter += 1
-            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor ACI: {color_index}")
 
             if new_layer_name not in doc.layers:
                 doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
