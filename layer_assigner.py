@@ -32,6 +32,7 @@ from ezdxf import DXFValueError
 COLOR_RED = 1
 COLOR_YELLOW = 2
 COLOR_GREEN = 3
+COLOR_MAGENTA = 6
 
 # --- CONFIGURAÇÕES PARA ANÁLISE POR TEXTO (MÉTODO 2) ---
 RAIO_DE_BUSCA = 800.0  # Ajuste conforme a escala desenho.
@@ -370,28 +371,6 @@ def _run_common_organization_tasks(doc, msp):
     subclassify_layer_zero(doc, msp)
     organize_remaining_layer_zero_entities(doc, msp)
 
-def get_open_entity_length(entity, precision: int) -> float | None:
-    """Calcula o comprimento de uma entidade aberta como LINE ou LWPOLYLINE."""
-    dxftype = entity.dxftype()
-    length = 0.0
-    try:
-        if dxftype == 'LINE':
-            length = entity.dxf.start.distance(entity.dxf.end)
-        elif dxftype in ('LWPOLYLINE', 'POLYLINE') and not entity.is_closed:
-            try:
-                with entity.points() as points_iterable:
-                    points = list(points_iterable)
-            except AttributeError:
-                points = list(entity.points())
-            
-            for i in range(len(points) - 1):
-                length += Vec3(points[i][:2]).distance(Vec3(points[i+1][:2]))
-        else:
-            return None
-        return round(length, precision)
-    except (AttributeError, IndexError):
-        return None
-
 def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_handles: set):
     """Agrupa peças equivalentes com base na área e perímetro."""
     print("\n--- Analisando geometrias para encontrar peças equivalentes ---")
@@ -402,8 +381,7 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
     for entity in msp:
         if entity.dxf.handle in processed_handles:
             continue
-            
-        if not hasattr(entity, 'dxftype'): 
+        if not hasattr(entity, 'dxftype'):
             continue
         properties = get_closed_entity_properties(entity)
         if properties:
@@ -423,13 +401,10 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
         for prop_key, entities in entities_by_properties.items()
         if prop_key[0] == 'CIRCLE'
     }
-
     stiffener_groups_to_remove = []
-
     for prop_key, entities in list(entities_by_properties.items()):
         if prop_key[0] not in ('LWPOLYLINE', 'POLYLINE'):
             continue
-
         is_stiffener, length = is_long_and_thin(entities[0])
         if is_stiffener:
             rounded_length = round(length)
@@ -437,69 +412,103 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
                 print(f"   - Encontrado grupo de enrijecedores (comprimento: {rounded_length}). Associando ao grupo de furos correspondente...")
                 circle_diameter_map[rounded_length].extend(entities)
                 stiffener_groups_to_remove.append(prop_key)
-
     for key in stiffener_groups_to_remove:
         del entities_by_properties[key]
 
     if not entities_by_properties:
         print("Nenhuma forma fechada válida foi encontrada para agrupar.")
+        _save_drawing(doc, filepath)
+        return
+        
+    print(f"\nForam encontrados {len(entities_by_properties)} grupos distintos de peças com geometrias equivalentes.")
+    
+    sorted_groups = sorted(
+        entities_by_properties.items(),
+        key=lambda item: (
+            (item[0][1] if item[0][0] == 'CIRCLE' else item[0][1] * len(item[1])),
+            (0 if item[0][0] == 'CIRCLE' else item[0][2])
+        ),
+        reverse=True
+    )
+    
+    print("\n--- Verificando contexto espacial (peças internas vs. externas) ---")
+    if len(sorted_groups) > 1:
+        main_plate_group_key, main_plate_entities = sorted_groups[0]
+        if main_plate_group_key[0] != 'CIRCLE':
+            main_plate_bbox = BoundingBox()
+            for entity in main_plate_entities:
+                try:
+                    main_plate_bbox.extend(entity.vertices_in_wcs())
+                except (AttributeError, TypeError, DXFValueError):
+                    pass
+            if main_plate_bbox.has_data:
+                print(f" - Peça principal (futura PECA_EQ_1) identificada. Área de verificação definida.")
+                internal_groups = []
+                external_groups = []
+                for group in sorted_groups[1:]:
+                    representative_entity = group[1][0]
+                    center = obter_centro_geometrico(representative_entity)
+                    if center and representative_entity.dxftype() in ('LWPOLYLINE', 'POLYLINE') and representative_entity.is_closed:
+                        if main_plate_bbox.inside(center):
+                            internal_groups.append(group)
+                        else:
+                            external_groups.append(group)
+                    else:
+                        external_groups.append(group)
+                final_sorted_groups = [sorted_groups[0]] + external_groups + internal_groups
+                print(f" - Reordenação concluída: 1 peça principal, {len(external_groups)} grupos externos, {len(internal_groups)} grupos internos.")
+            else:
+                final_sorted_groups = sorted_groups
+                print(" - Aviso: Não foi possível definir a área da peça principal. Usando a ordenação padrão por área.")
+        else:
+            final_sorted_groups = sorted_groups
+            print(" - Peça principal é um círculo. Pulando a verificação espacial.")
     else:
-        print(f"\nForam encontrados {len(entities_by_properties)} grupos distintos de peças com geometrias equivalentes.")
-        layer_counter = 0
-        non_circle_counter = 0        
-        sorted_groups = sorted(
-            entities_by_properties.items(),
-            key=lambda item: (
-                (item[0][1] if item[0][0] == 'CIRCLE' else item[0][1] * len(item[1])),
-                (0 if item[0][0] == 'CIRCLE' else item[0][2])
-            ),
-            reverse=True
-        )
+        final_sorted_groups = sorted_groups
 
-        if len(sorted_groups) >= 6:
-            group_5_key, group_5_entities = sorted_groups[4]
-            first_entity_of_group_5 = group_5_entities[0]
+    # --- LÓGICA ESPECIAL (RETÂNGULO) ---
+    if len(final_sorted_groups) >= 6:
+        first_group_entities = final_sorted_groups[0][1]
+        representative_entity = first_group_entities[0]
 
-            if is_rectangular(first_entity_of_group_5):
-                print("\n--- Lógica Especial: PECA_EQ_5 é retangular. Mesclando com PECA_EQ_6. ---")
-                
-                group_6_key, group_6_entities = sorted_groups[5]
-                
-                group_5_entities.extend(group_6_entities)
-                print(f" - {len(group_6_entities)} peças do grupo 6 (área ~{group_6_key[1]}) foram movidas para o grupo 5.")
-                del sorted_groups[5]
-
-        for prop_key, entities in sorted_groups:
-            layer_counter += 1
-            new_layer_name = f"{PECA_EQ_LAYER_PREFIX}_{layer_counter}"
-            
-            entity_type = prop_key[0]
-            is_like_a_circle = False
-            if entity_type == 'CIRCLE':
+        if is_rectangular(representative_entity):
+            print("\n--- Lógica Especial: PECA_EQ_1 é retangular. Mesclando PECA_EQ_6 com PECA_EQ_1. ---")
+            group_6_key, group_6_entities = final_sorted_groups[5]
+            first_group_entities.extend(group_6_entities)
+            print(f" - {len(group_6_entities)} peças do grupo 6 (área ~{group_6_key[1]}) foram movidas para o grupo da PECA_EQ_1.")
+            del final_sorted_groups[5]
+    
+    layer_counter = 0
+    non_circle_counter = 0
+    
+    for prop_key, entities in final_sorted_groups:
+        layer_counter += 1
+        new_layer_name = f"{PECA_EQ_LAYER_PREFIX}_{layer_counter}"
+        
+        entity_type = prop_key[0]
+        is_like_a_circle = False
+        if entity_type == 'CIRCLE':
+            is_like_a_circle = True
+            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo 'CIRCLE' com diâmetro ~{prop_key[1]}. Cor ACI: {COLOR_RED}")
+        else:
+            area_key = prop_key[1]
+            perimeter_key = prop_key[2]
+            print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor ACI: {PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]}")
+            isoperimetric_ratio = (4 * math.pi * area_key) / (perimeter_key**2)
+            if isoperimetric_ratio > 0.98: 
                 is_like_a_circle = True
-                area_key = round(math.pi * (prop_key[1]/2)**2)
-                perimeter_key = round(math.pi * prop_key[1])
-                print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo 'CIRCLE' com diâmetro ~{prop_key[1]}. Cor ACI: {COLOR_RED}")
-            else:
-                area_key = prop_key[1]
-                perimeter_key = prop_key[2]
-                print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor ACI: {PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]}")
-                isoperimetric_ratio = (4 * math.pi * area_key) / (perimeter_key**2)
-                if isoperimetric_ratio > 0.98: 
-                    is_like_a_circle = True
 
-            if is_like_a_circle:
-                color_index = COLOR_RED
-            else:
-                color_index = PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]
-                non_circle_counter += 1
+        if is_like_a_circle:
+            color_index = COLOR_RED
+        else:
+            color_index = PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]
+            non_circle_counter += 1
 
-            if new_layer_name not in doc.layers:
-                doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
-            for entity in entities:
-                entity.dxf.layer = new_layer_name
+        if new_layer_name not in doc.layers:
+            doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
+        for entity in entities:
+            entity.dxf.layer = new_layer_name
 
-    # --- LÓGICA DE REDIRECIONAMENTO DE LAYER (PÓS-PROCESSAMENTO) ---
     print("\n--- Redirecionando layers de vistas diferentes ---")
     source_layer_name = f"{PECA_EQ_LAYER_PREFIX}_5"
     target_layer_name = f"{PECA_EQ_LAYER_PREFIX}_1"
@@ -512,14 +521,12 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
             for entity in entities_to_move:
                 entity.dxf.layer = target_layer_name
             
-            # Remove a camada de origem que agora está vazia
             try:
                 doc.layers.remove(source_layer_name)
                 print(f" - Layer '{source_layer_name}' removido.")
-            except DXFValueError: # Pode acontecer se a camada não puder ser removida
+            except DXFValueError:
                 print(f" - Aviso: Não foi possível remover o layer '{source_layer_name}'.")
 
-    # Redireciona a camada de furos e vistas para a PECA_EQ_1
     source_layer_furos = "FUROS_E_VISTAS"
     if source_layer_furos in doc.layers and target_layer_name in doc.layers:
         entities_to_move = msp.query(f'*[layer=="{source_layer_furos}"]')
@@ -529,12 +536,23 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
             for entity in entities_to_move:
                 entity.dxf.layer = target_layer_name
             
-            # Remove a camada de origem que agora está vazia
             try:
                 doc.layers.remove(source_layer_furos)
                 print(f" - Layer '{source_layer_furos}' removido.")
             except DXFValueError:
                 print(f" - Aviso: Não foi possível remover o layer '{source_layer_furos}'.")
+
+    print("\n--- Aplicando Cores Específicas (Overrides) ---")
+    
+    # Regra: A camada PECA_EQ_6 deve ser sempre Magenta.
+    layer_to_colorize = f"{PECA_EQ_LAYER_PREFIX}_6"
+    
+    if layer_to_colorize in doc.layers:
+        layer = doc.layers.get(layer_to_colorize)
+        layer.dxf.color = COLOR_MAGENTA
+        print(f" - Override aplicado: Cor da camada '{layer_to_colorize}' definida para Magenta.")
+    else:
+        print(f" - Camada '{layer_to_colorize}' não encontrada para override de cor (pode ter sido mesclada ou não existe).")
 
     _save_drawing(doc, filepath)
 
@@ -638,10 +656,10 @@ def is_arrow(entity):
 
 def ensure_layer(doc, layer_name, color):
     if layer_name not in doc.layers:
-        print(f"   + Criando camada '{layer_name}' com a cor {get_aci_color_name(color)}.")
+        print(f"   + Criando nova camada '{layer_name}' com a cor {get_aci_color_name(color)}.")
         doc.layers.new(name=layer_name, dxfattribs={'color': color})
-    else:
-        doc.layers.get(layer_name).dxf.color = color
+    # else:
+    #     doc.layers.get(layer_name).dxf.color = color
 
 def set_layer0_to_yellow(doc):
     layer_name = '0'
@@ -679,6 +697,19 @@ def set_g_symbol_to_yellow(doc):
             ensure_layer(doc, default_name, COLOR_LAYER_0)
     except Exception as e:
         print(f"Aviso: erro ao procurar camadas G-SYMBOL: {e}")
+
+def set_lhidden_to_red(doc):
+    """Encontra a camada L-HIDDEN e define sua cor para vermelho."""
+    layer_name_upper = "L-HIDDEN"
+    try:
+        # Itera sobre as camadas para encontrar a correspondente, ignorando maiúsculas/minúsculas
+        for layer in doc.layers:
+            if layer.dxf.name.upper() == layer_name_upper:
+                layer.dxf.color = COLOR_RED
+                print(f"   * Camada existente '{layer.dxf.name}' atualizada para cor Vermelha.")
+                return
+    except Exception as e:
+        print(f"Aviso: erro ao tentar ajustar a cor da camada L-HIDDEN: {e}")
 
 def process_cotas_and_texts(doc, msp, processed_handles):
     cotas_layer = 'COTAS'
@@ -748,6 +779,7 @@ def process_drawing_by_text(filepath: str, **kwargs):
     print("\nIniciando reestruturação com base em texto (Método 2).")
     set_layer0_to_yellow(doc)
     set_g_symbol_to_yellow(doc)
+    set_lhidden_to_red(doc)
     
     print("\n--- Fase 1: Identificando sistemas (Perfis, Chumbadores, Eixos) ---")
     for keyword, (layer_name, color) in SEMANTIC_LAYERS.items():

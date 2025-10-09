@@ -9,7 +9,7 @@ Ambos os modos também executam tarefas de organização de layers padrão.
 
 Persona: Desenvolvedor Python Sênior
 Projeto: Ferramenta de automação para desenhos de estruturas metálicas.
-Revisão: 23.0 - 2025-10-08 (Corrigido para identificar vistas de furo retangulares, não apenas quadradas)
+Revisão: 23.2 - 2025-10-09 (Refinada a lógica de ordenação de grupos para ser consistente, baseada na área total)
 """
 
 import ezdxf
@@ -74,10 +74,16 @@ LAYER_ZERO_SUBCLASSIFICATION = {
     ('HATCH',): ('LAYER0_HACHURAS', COLOR_RED),
 }
 
-# --- CONFIGURAÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ---
-PECA_EQ_LAYER_COLORS = [1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15] # Amarelo (2) removido
-PECA_EQ_LAYER_PREFIX = "PECA_EQ"
+# ●▽●▽●▽●▽●▽●▽●▽● CONFIGURAÇÕES PARA ANÁLISE POR ÁREA (MÉTODO 1) ●▽●▽●▽●▽●▽●▽●▽●
+# Cores ACI: 1=Vermelho, 3=Verde, 4=Ciano, 5=Azul, 6=Magenta, 8,9,10...
+# --- Paleta de cores para as camadas PECA_EQ ---
+# Modifique estas constantes para alterar as cores das camadas geradas.
+COR_CHAPA_BASE = 5  # Azul (para a maior peça, PECA_EQ_1)
+CORES_SECUNDARIAS = [3, 1, 3, 8, 9, 10, 11, 12, 13, 14, 15] # Magenta, Ciano, Verde, etc.
 
+PECA_EQ_LAYER_COLORS = [COR_CHAPA_BASE] + CORES_SECUNDARIAS
+PECA_EQ_LAYER_PREFIX = "PECA_EQ"
+# ●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽●▽●▽●▽●●▽●▽●▽●▽▽ 
 # --- FUNÇÕES AUXILIARES GERAIS ---
 
 def get_aci_color_name(aci_index):
@@ -171,7 +177,7 @@ def pre_process_holes_and_side_views(doc, msp) -> set:
         if is_side_view:
             matched_diameter = round(dimension)
             if matched_diameter in known_diameters:
-                 matched_side_views[matched_diameter].append(entity)
+                matched_side_views[matched_diameter].append(entity)
 
     moved_count = 0
     for diameter, circle_list in circles_by_diameter.items():
@@ -386,6 +392,28 @@ def get_open_entity_length(entity, precision: int) -> float | None:
     except (AttributeError, IndexError):
         return None
 
+# <<< ALTERAÇÃO INÍCIO: Nova função de ordenação universal
+def get_group_sort_key(item: tuple) -> tuple[float, float]:
+    """
+    Calcula uma chave de ordenação consistente (área total, perímetro/área individual) para um grupo de entidades.
+    """
+    prop_key, entities = item
+    dxftype = prop_key[0]
+    count = len(entities)
+
+    if dxftype == 'CIRCLE':
+        # Para círculos, a prop_key armazena ('CIRCLE', area, perimetro), então usamos area diretamente
+        area = prop_key[1]
+        perimeter = prop_key[2]
+        total_area = area * count
+        return (total_area, perimeter)
+    else:  # LWPOLYLINE, etc.
+        area = prop_key[1]
+        perimeter = prop_key[2]
+        total_area = area * count
+        return (total_area, perimeter)
+# <<< ALTERAÇÃO FIM
+
 def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_handles: set):
     """Agrupa peças equivalentes com base na área e perímetro."""
     print("\n--- Analisando geometrias para encontrar peças equivalentes ---")
@@ -402,21 +430,23 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
         properties = get_closed_entity_properties(entity)
         if properties:
             dxftype, area, perimeter = properties
-            if dxftype == 'CIRCLE':
-                diameter = round(2 * math.sqrt(area / math.pi))
-                prop_key = (dxftype, diameter)
-            else:
-                prop_key = (dxftype, round(area, precision), round(perimeter, precision))
+            # <<< ALTERAÇÃO INÍCIO: Tratar Círculo da mesma forma que outras geometrias
+            # Armazena (dxftype, area, perimetro) para TODOS os tipos.
+            prop_key = (dxftype, round(area, precision), round(perimeter, precision))
+            # <<< ALTERAÇÃO FIM
             entities_by_properties[prop_key].append(entity)
         else:
             unclosed_entities.append(entity)
 
     print("\n--- Associando enrijecedores (linhas) a furos (círculos) por diâmetro ---")
-    circle_diameter_map = {
-        prop_key[1]: entities
-        for prop_key, entities in entities_by_properties.items()
-        if prop_key[0] == 'CIRCLE'
-    }
+    
+    # Recalcula o mapa de círculos baseado em diâmetro aproximado para associação
+    circle_diameter_map = defaultdict(list)
+    for prop_key, entities in entities_by_properties.items():
+        if prop_key[0] == 'CIRCLE':
+            area = prop_key[1]
+            diameter = round(2 * math.sqrt(area / math.pi))
+            circle_diameter_map[diameter].extend(entities)
 
     stiffener_groups_to_remove = []
 
@@ -429,8 +459,16 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
             rounded_length = round(length)
             if rounded_length in circle_diameter_map:
                 print(f"   - Encontrado grupo de enrijecedores (comprimento: {rounded_length}). Associando ao grupo de furos correspondente...")
-                circle_diameter_map[rounded_length].extend(entities)
-                stiffener_groups_to_remove.append(prop_key)
+                # Adiciona os enrijecedores ao primeiro grupo de furos encontrado com diâmetro compatível
+                target_prop_key_for_stiffeners = None
+                for pk, ent_list in entities_by_properties.items():
+                    if ent_list == circle_diameter_map[rounded_length]:
+                        target_prop_key_for_stiffeners = pk
+                        break
+                if target_prop_key_for_stiffeners:
+                    entities_by_properties[target_prop_key_for_stiffeners].extend(entities)
+                    stiffener_groups_to_remove.append(prop_key)
+
 
     for key in stiffener_groups_to_remove:
         del entities_by_properties[key]
@@ -439,16 +477,14 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
         print("Nenhuma forma fechada válida foi encontrada para agrupar.")
     else:
         print(f"\nForam encontrados {len(entities_by_properties)} grupos distintos de peças com geometrias equivalentes.")
-        layer_counter = 0
-        non_circle_counter = 0        
+        
+        # <<< ALTERAÇÃO INÍCIO: Usar a nova função de ordenação universal
         sorted_groups = sorted(
             entities_by_properties.items(),
-            key=lambda item: (
-                (item[0][1] if item[0][0] == 'CIRCLE' else item[0][1] * len(item[1])),
-                (0 if item[0][0] == 'CIRCLE' else item[0][2])
-            ),
+            key=get_group_sort_key,
             reverse=True
         )
+        # <<< ALTERAÇÃO FIM
 
         if len(sorted_groups) >= 6:
             group_5_key, group_5_entities = sorted_groups[4]
@@ -463,24 +499,26 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
                 print(f" - {len(group_6_entities)} peças do grupo 6 (área ~{group_6_key[1]}) foram movidas para o grupo 5.")
                 del sorted_groups[5]
 
+        peca_eq1_polylines_to_process_later = []
+        
+        layer_counter = 0
+        non_circle_counter = 0
         for prop_key, entities in sorted_groups:
             layer_counter += 1
             new_layer_name = f"{PECA_EQ_LAYER_PREFIX}_{layer_counter}"
             
-            entity_type = prop_key[0]
+            entity_type, area_key, perimeter_key = prop_key
+            
             is_like_a_circle = False
             if entity_type == 'CIRCLE':
                 is_like_a_circle = True
-                area_key = round(math.pi * (prop_key[1]/2)**2)
-                perimeter_key = round(math.pi * prop_key[1])
-                print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo 'CIRCLE' com diâmetro ~{prop_key[1]}. Cor ACI: {COLOR_RED}")
+                print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo 'CIRCLE' com área ~{area_key}. Cor ACI: {COLOR_RED}")
             else:
-                area_key = prop_key[1]
-                perimeter_key = prop_key[2]
                 print(f" - Grupo {layer_counter}: Criando layer '{new_layer_name}' para {len(entities)} peças do tipo '{entity_type}' com área ~{area_key} e perímetro ~{perimeter_key}. Cor ACI: {PECA_EQ_LAYER_COLORS[non_circle_counter % len(PECA_EQ_LAYER_COLORS)]}")
-                isoperimetric_ratio = (4 * math.pi * area_key) / (perimeter_key**2)
-                if isoperimetric_ratio > 0.98: 
-                    is_like_a_circle = True
+                if perimeter_key > 0: # Evita divisão por zero
+                    isoperimetric_ratio = (4 * math.pi * area_key) / (perimeter_key**2)
+                    if isoperimetric_ratio > 0.98: 
+                        is_like_a_circle = True
 
             if is_like_a_circle:
                 color_index = COLOR_RED
@@ -490,8 +528,56 @@ def _analyze_and_group_by_area(doc, msp, precision, filepath: str, processed_han
 
             if new_layer_name not in doc.layers:
                 doc.layers.new(name=new_layer_name, dxfattribs={'color': color_index})
-            for entity in entities:
-                entity.dxf.layer = new_layer_name
+
+            if layer_counter == 1:
+                print(f"   - Polylines do grupo '{new_layer_name}' serão processadas no final.")
+                for entity in entities:
+                    if entity.dxftype() in ('LWPOLYLINE', 'POLYLINE'):
+                        peca_eq1_polylines_to_process_later.append(entity)
+                    else:
+                        entity.dxf.layer = new_layer_name
+            else:
+                for entity in entities:
+                    entity.dxf.layer = new_layer_name
+
+    if peca_eq1_polylines_to_process_later:
+        target_layer_name_deferred = f"{PECA_EQ_LAYER_PREFIX}_1"
+        print(f"\n--- Atribuindo layer para {len(peca_eq1_polylines_to_process_later)} Polylines adiadas do grupo '{target_layer_name_deferred}' ---")
+        for entity in peca_eq1_polylines_to_process_later:
+            entity.dxf.layer = target_layer_name_deferred
+
+    print("\n--- Redirecionando layers de vistas diferentes ---")
+    source_layer_name = f"{PECA_EQ_LAYER_PREFIX}_5"
+    target_layer_name = f"{PECA_EQ_LAYER_PREFIX}_1"
+
+    if source_layer_name in doc.layers and target_layer_name in doc.layers:
+        entities_to_move = msp.query(f'*[layer=="{source_layer_name}"]')
+        count = len(entities_to_move)
+        if count > 0:
+            print(f" - Movendo {count} peças do layer '{source_layer_name}' para o layer '{target_layer_name}'.")
+            for entity in entities_to_move:
+                entity.dxf.layer = target_layer_name
+            
+            try:
+                doc.layers.remove(source_layer_name)
+                print(f" - Layer '{source_layer_name}' removido.")
+            except DXFValueError:
+                print(f" - Aviso: Não foi possível remover o layer '{source_layer_name}'.")
+
+    source_layer_furos = "FUROS_E_VISTAS"
+    if source_layer_furos in doc.layers and target_layer_name in doc.layers:
+        entities_to_move = msp.query(f'*[layer=="{source_layer_furos}"]')
+        count = len(entities_to_move)
+        if count > 0:
+            print(f" - Movendo {count} peças do layer '{source_layer_furos}' para o layer '{target_layer_name}'.")
+            for entity in entities_to_move:
+                entity.dxf.layer = target_layer_name
+            
+            try:
+                doc.layers.remove(source_layer_furos)
+                print(f" - Layer '{source_layer_furos}' removido.")
+            except DXFValueError:
+                print(f" - Aviso: Não foi possível remover o layer '{source_layer_furos}'.")
 
     _save_drawing(doc, filepath)
 
