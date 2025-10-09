@@ -330,6 +330,8 @@ def process_drawing_by_area(filepath: str, precision: int):
     doc, msp = _load_drawing(filepath)
     if not doc:
         return
+    
+    set_lhidden_to_red(doc)  #Chamada da funcao para definir o L-HIDDEN para vermelho
 
     processed_handles = pre_process_holes_and_side_views(doc, msp)
     _run_common_organization_tasks(doc, msp)    
@@ -699,15 +701,29 @@ def set_g_symbol_to_yellow(doc):
         print(f"Aviso: erro ao procurar camadas G-SYMBOL: {e}")
 
 def set_lhidden_to_red(doc):
-    """Encontra a camada L-HIDDEN e define sua cor para vermelho."""
+    """
+    Encontra a camada L-HIDDEN e define sua cor para vermelho.
+    Se a camada não existir, ela será criada com a cor vermelha.
+    """
     layer_name_upper = "L-HIDDEN"
+    found_layer = None
+
     try:
         # Itera sobre as camadas para encontrar a correspondente, ignorando maiúsculas/minúsculas
         for layer in doc.layers:
             if layer.dxf.name.upper() == layer_name_upper:
-                layer.dxf.color = COLOR_RED
-                print(f"   * Camada existente '{layer.dxf.name}' atualizada para cor Vermelha.")
-                return
+                found_layer = layer
+                break # Encontrou a camada, pode parar de procurar
+
+        if found_layer:
+            # Cenário 1: A camada existe, apenas atualiza a cor.
+            found_layer.dxf.color = COLOR_RED
+            print(f"   * Camada existente '{found_layer.dxf.name}' atualizada para cor Vermelha.")
+        else:
+            # Cenário 2: A camada não existe, então a criamos.
+            doc.layers.new(name="L-HIDDEN", dxfattribs={'color': COLOR_RED})
+            print(f"   * Camada 'L-HIDDEN' não encontrada. Criando nova camada na cor Vermelha.")
+
     except Exception as e:
         print(f"Aviso: erro ao tentar ajustar a cor da camada L-HIDDEN: {e}")
 
